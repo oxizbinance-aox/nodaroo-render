@@ -8,7 +8,8 @@ Pterodactyl (Nodaroo) Python server. Built for AOX's "Kang Muse" server.
 What it does
 ------------
 * 2D cinematic renderer (default path, works with only Python + Pillow +
-  numpy + ffmpeg): takes a JSON scene spec and renders a video in the
+  ffmpeg; numpy is optional): takes a JSON scene spec and renders a
+  video in the
   tetsuoai style AOX uses — dark background, pink/magenta accent
   (255, 90, 180), big kinetic headline, film grain + vignette,
   slow push-in, hard cuts. Default 1280x720 @ 24fps.
@@ -43,6 +44,7 @@ import base64
 import collections
 import io
 import json
+import math
 import os
 import platform
 import shutil
@@ -52,8 +54,14 @@ import threading
 import time
 import uuid
 
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont
+
+try:
+    import numpy as np
+    _HAS_NUMPY = True
+except ImportError:  # slim install: flask + pillow only (see README)
+    np = None
+    _HAS_NUMPY = False
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -105,7 +113,12 @@ def _which_or_none(name):
 
 
 def ffmpeg_exe():
-    """System ffmpeg first, else the imageio-ffmpeg bundled binary."""
+    """System ffmpeg first, else the imageio-ffmpeg bundled binary.
+
+    imageio is OPTIONAL (not in the slim requirements.txt): this only
+    works when imageio[ffmpeg] was installed, e.g. via PY_PACKAGES.
+    Returns None when no ffmpeg is available at all.
+    """
     exe = shutil.which("ffmpeg")
     if exe:
         return exe
@@ -132,6 +145,7 @@ def get_specs():
         "ffmpeg": ffmpeg_exe(),
         "blender": blender_exe(),
         "node": _which_or_none("node"),
+        "numpy": _HAS_NUMPY,
     }
 
 
@@ -144,6 +158,7 @@ def print_diagnostics():
     print(f"  RAM      : {s['ram_gb']} GiB total" if s["ram_gb"] else "  RAM      : unknown", flush=True)
     print(f"  Disk     : {s['disk_free_gb']} GiB free / {s['disk_total_gb']} GiB total", flush=True)
     print(f"  ffmpeg   : {s['ffmpeg'] or 'NOT FOUND (2D render needs it)'}", flush=True)
+    print(f"  numpy    : {'yes (fast 2D path)' if _HAS_NUMPY else 'no (slim install — pure-Pillow 2D path)'}", flush=True)
     print(f"  blender  : {s['blender'] or 'NOT FOUND (3D path disabled)'}", flush=True)
     print(f"  node     : {s['node'] or 'NOT FOUND (not required)'}", flush=True)
     print(f"  port     : {PORT} (bind 0.0.0.0)", flush=True)
@@ -334,33 +349,66 @@ def worker_loop():
 
 
 # ---------------------------------------------------------------------------
-# 2D cinematic renderer (Pillow + numpy, streamed to ffmpeg)
+# 2D cinematic renderer (Pillow, streamed to ffmpeg; numpy is an optional
+# fast path — every numpy operation below has a pure-Pillow fallback)
 # ---------------------------------------------------------------------------
 
 _vignette_cache = {}
 
 
 def vignette_mask(width, height, strength=0.42):
-    """Radial darkening mask, cached per resolution. 1.0 = centre, ~0.6 = corner."""
-    key = (width, height, strength)
+    """Radial darkening mask, cached per resolution. 1.0 = centre, ~0.6 = corner.
+
+    numpy path returns a float32 array (H x W); the pure-Pillow fallback
+    returns an "L" image (255 = centre, darker at the corners) computed
+    on a small grid with the same formula and upscaled — the falloff is
+    smooth, so the low-res mask is visually identical.
+    """
+    key = (width, height, strength, _HAS_NUMPY)
     if key in _vignette_cache:
         return _vignette_cache[key]
-    yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
-    cx, cy = width / 2.0, height / 2.0
-    dist = np.sqrt(((xx - cx) / (width * 0.62)) ** 2 + ((yy - cy) / (height * 0.62)) ** 2)
-    mask = 1.0 - strength * np.clip(dist - 0.45, 0, 1) ** 2
-    mask = np.clip(mask, 0, 1).astype(np.float32)
+    if _HAS_NUMPY:
+        yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
+        cx, cy = width / 2.0, height / 2.0
+        dist = np.sqrt(((xx - cx) / (width * 0.62)) ** 2 + ((yy - cy) / (height * 0.62)) ** 2)
+        mask = 1.0 - strength * np.clip(dist - 0.45, 0, 1) ** 2
+        mask = np.clip(mask, 0, 1).astype(np.float32)
+    else:
+        gw, gh = 96, 54
+        vals = []
+        for gy in range(gh):
+            for gx in range(gw):
+                dx = ((gx + 0.5) / gw - 0.5) / 0.62
+                dy = ((gy + 0.5) / gh - 0.5) / 0.62
+                dist = math.sqrt(dx * dx + dy * dy)
+                d = min(max(dist - 0.45, 0.0), 1.0)
+                vals.append(int(round(255 * min(max(1.0 - strength * d * d, 0.0), 1.0))))
+        mask = Image.new("L", (gw, gh))
+        mask.putdata(vals)
+        mask = mask.resize((width, height), Image.BICUBIC)
     _vignette_cache[key] = mask
     return mask
 
 
 def vertical_gradient(width, height, top_rgb, bottom_rgb):
-    """Smooth top->bottom gradient as a uint8 RGB array."""
-    t = np.linspace(0, 1, height, dtype=np.float32)[:, None, None]
-    top = np.array(top_rgb, dtype=np.float32)[None, None, :]
-    bottom = np.array(bottom_rgb, dtype=np.float32)[None, None, :]
-    grad = top * (1 - t) + bottom * t
-    return np.repeat(grad.astype(np.uint8), width, axis=1)
+    """Smooth top->bottom gradient.
+
+    numpy path returns a uint8 RGB array (H x W x 3); the pure-Pillow
+    fallback returns a PIL RGB image (built as a 1 x H strip, then
+    stretched — exact for a vertical gradient).
+    """
+    if _HAS_NUMPY:
+        t = np.linspace(0, 1, height, dtype=np.float32)[:, None, None]
+        top = np.array(top_rgb, dtype=np.float32)[None, None, :]
+        bottom = np.array(bottom_rgb, dtype=np.float32)[None, None, :]
+        grad = top * (1 - t) + bottom * t
+        return np.repeat(grad.astype(np.uint8), width, axis=1)
+    strip = Image.new("RGB", (1, height))
+    rows = [tuple(int(round(top_rgb[c] + (bottom_rgb[c] - top_rgb[c])
+                           * y / max(1, height - 1)))
+                  for c in range(3)) for y in range(height)]
+    strip.putdata(rows)
+    return strip.resize((width, height))
 
 
 def render_scene_base(scene, bw, bh):
@@ -390,14 +438,30 @@ def render_scene_base(scene, bw, bh):
             print(f"[render] bg_image_b64 failed ({exc}); using gradient", flush=True)
             base = None
     if base is None:
-        arr = vertical_gradient(bw, bh, bg_top, bg_bottom)
-        # soft radial glow, slightly above centre, in the accent hue
-        yy, xx = np.mgrid[0:bh, 0:bw].astype(np.float32)
-        glow = np.exp(-(((xx - bw * 0.5) / (bw * 0.55)) ** 2
-                        + ((yy - bh * 0.38) / (bh * 0.55)) ** 2))
-        glow = (glow * 22).astype(np.uint8)
-        arr = np.clip(arr.astype(np.int16) + glow[:, :, None], 0, 255).astype(np.uint8)
-        base = Image.fromarray(arr, "RGB")
+        if _HAS_NUMPY:
+            arr = vertical_gradient(bw, bh, bg_top, bg_bottom)
+            # soft radial glow, slightly above centre, in the accent hue
+            yy, xx = np.mgrid[0:bh, 0:bw].astype(np.float32)
+            glow = np.exp(-(((xx - bw * 0.5) / (bw * 0.55)) ** 2
+                            + ((yy - bh * 0.38) / (bh * 0.55)) ** 2))
+            glow = (glow * 22).astype(np.uint8)
+            arr = np.clip(arr.astype(np.int16) + glow[:, :, None], 0, 255).astype(np.uint8)
+            base = Image.fromarray(arr, "RGB")
+        else:
+            # pure Pillow: vertical gradient + the same elliptical glow,
+            # computed on a small grid with the same formula and upscaled.
+            base = vertical_gradient(bw, bh, bg_top, bg_bottom)
+            gw, gh = 96, 54
+            vals = []
+            for gy in range(gh):
+                for gx in range(gw):
+                    fx = ((gx + 0.5) / gw - 0.5) / 0.55
+                    fy = ((gy + 0.5) / gh - 0.38) / 0.55
+                    vals.append(int(round(22 * math.exp(-(fx * fx + fy * fy)))))
+            glow = Image.new("L", (gw, gh))
+            glow.putdata(vals)
+            glow = glow.resize((bw, bh), Image.BICUBIC)
+            base = ImageChops.add(base, Image.merge("RGB", (glow, glow, glow)))
 
     draw = ImageDraw.Draw(base)
     accent = hex_to_rgb(scene.get("accent", "#ff5ab4"), ACCENT)
@@ -453,15 +517,30 @@ def render_scene_base(scene, bw, bh):
 
 def finish_frame(frame_pil, width, height, grain, letterbox, vig):
     """Grain + vignette (+ optional letterbox) on the final W x H frame."""
-    if grain and grain > 0:
-        arr = np.asarray(frame_pil).astype(np.int16)
-        noise = np.random.randint(-int(grain), int(grain) + 1,
-                                  size=(height, width, 1), dtype=np.int16)
-        arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
-        frame_pil = Image.fromarray(arr, "RGB")
-    if vig is not None:
-        arr = np.asarray(frame_pil).astype(np.float32) * vig[:, :, None]
-        frame_pil = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), "RGB")
+    if _HAS_NUMPY:
+        if grain and grain > 0:
+            arr = np.asarray(frame_pil).astype(np.int16)
+            noise = np.random.randint(-int(grain), int(grain) + 1,
+                                      size=(height, width, 1), dtype=np.int16)
+            arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
+            frame_pil = Image.fromarray(arr, "RGB")
+        if vig is not None:
+            arr = np.asarray(frame_pil).astype(np.float32) * vig[:, :, None]
+            frame_pil = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), "RGB")
+    else:
+        if grain and grain > 0:
+            # effect_noise is Gaussian around 128; adding it with an
+            # offset of -128 adds ~zero-mean noise, like the numpy path.
+            # sigma ~ grain/sqrt(3) matches the numpy path's uniform
+            # +/-grain spread (same standard deviation, same look).
+            noise = Image.effect_noise((width, height),
+                                       max(1, int(grain * 0.6))).convert("RGB")
+            frame_pil = ImageChops.add(frame_pil, noise, 1.0, -128)
+        if vig is not None:
+            # vig is an "L" mask here: composite the frame over black.
+            frame_pil = Image.composite(frame_pil,
+                                        Image.new("RGB", (width, height), (0, 0, 0)),
+                                        vig)
     if letterbox:
         draw = ImageDraw.Draw(frame_pil)
         bar = int(height * 0.09)
@@ -494,7 +573,12 @@ def draw_label_overlay(frame_pil, scene, width, height, letterbox):
 
 
 def iter_scene_frames(scene, width, height, fps, grain, letterbox, vig):
-    """Yield numpy RGB frames (W x H) for one scene, with its motion effect."""
+    """Yield RGB frames (W x H) for one scene, with its motion effect.
+
+    numpy path yields uint8 arrays; the pure-Pillow fallback yields PIL
+    RGB images. Both expose .tobytes() in raw rgb24 layout, which is
+    what the ffmpeg encoder consumes.
+    """
     n = max(1, int(round(float(scene.get("duration", 3.0)) * fps)))
     bw, bh = int(width * ZOOM), int(height * ZOOM)
     base = render_scene_base(scene, bw, bh)
@@ -514,7 +598,7 @@ def iter_scene_frames(scene, width, height, fps, grain, letterbox, vig):
             frame = frame.resize((width, height), Image.LANCZOS)
         frame = finish_frame(frame, width, height, grain, letterbox, vig)
         draw_label_overlay(frame, scene, width, height, letterbox)
-        yield np.asarray(frame)
+        yield np.asarray(frame) if _HAS_NUMPY else frame
 
 
 def frame_stream(job):
@@ -543,9 +627,12 @@ def frame_stream(job):
                 a = pending.popleft()
                 b = next(gen)
                 alpha = (j + 1) / (fade + 1)
-                blended = (a.astype(np.float32) * (1 - alpha)
-                           + b.astype(np.float32) * alpha)
-                yield np.clip(blended, 0, 255).astype(np.uint8)
+                if _HAS_NUMPY:
+                    blended = (a.astype(np.float32) * (1 - alpha)
+                               + b.astype(np.float32) * alpha)
+                    yield np.clip(blended, 0, 255).astype(np.uint8)
+                else:
+                    yield Image.blend(a, b, alpha)
             remaining = n - fade
         else:
             while pending:
@@ -566,7 +653,9 @@ def encode_frames_to_mp4(frame_iter, out_path, width, height, fps, job, total_fr
     if not exe:
         raise RuntimeError(
             "No ffmpeg available on this server. Install ffmpeg, or add "
-            "imageio[ffmpeg] to requirements.txt so a bundled binary is used.")
+            "imageio[ffmpeg] to the panel's PY_PACKAGES field (it is an "
+            "optional enhancement, not in the slim requirements.txt) so a "
+            "bundled binary is used.")
     cmd = [exe, "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
            "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
            "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p",
@@ -772,7 +861,7 @@ def index():
     return jsonify({
         "service": "nodaroo-cinematic-render",
         "alive": True,
-        "version": "1.0.0",
+        "version": "1.1.0",
         "specs": {
             "cpu_count": specs["cpu_count"],
             "ram_gb": specs["ram_gb"],
@@ -783,6 +872,7 @@ def index():
         "capabilities": {
             "ffmpeg": bool(specs["ffmpeg"]),
             "ffmpeg_exe": specs["ffmpeg"],
+            "numpy": bool(specs["numpy"]),
             "blender": bool(specs["blender"]),
             "blender_exe": specs["blender"],
             "node": bool(specs["node"]),
