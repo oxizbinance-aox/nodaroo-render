@@ -98,7 +98,9 @@ Nodaroo Cinematic Render Service — starting
   blender  : NOT FOUND (3D path disabled)
   node     : NOT FOUND (not required)
   port     : 8080 (bind 0.0.0.0)
+  tunnel   : starting in background — URL appears below + in GET / (public_url)
 [ready] listening on 0.0.0.0:8080 — GET / for status, POST /render to queue a job
+[tunnel] public URL: https://word-word-word-word.trycloudflare.com
 ```
 
 If `ffmpeg` shows NOT FOUND, the 2D renderer cannot encode — add
@@ -112,12 +114,19 @@ normal: the 2D renderer still works, just slower. Add `numpy` to
 
 ## 2. Check it is alive
 
-The server listens on the port Nodaroo assigned to it. For this server
-that is **25571** (`au1.nodaroo.fun:25571`). If the panel shows a
-different port, use that one instead.
+**Use the tunnel URL, not the Nodaroo address.** The server's assigned
+address `au1.nodaroo.fun:25571` does **not** resolve or answer from the
+internet (23 Nov 2026: AOX's laptop got `NXDOMAIN`, the cloud browser
+got `name_not_resolved`, and the one resolver that did answer gave a
+`198.18.x.x` address that never answers HTTP). So the service exposes
+itself through a Cloudflare quick tunnel instead — see section 2b for
+where to find that URL. The Nodaroo address is only a fallback; do
+not rely on it.
 
 ```bash
-curl http://au1.nodaroo.fun:25571/
+# replace <tunnel-url> with the https://<...>.trycloudflare.com URL
+# from the console log or from GET / (see section 2b)
+curl <tunnel-url>/
 ```
 
 Expected (abridged):
@@ -126,6 +135,7 @@ Expected (abridged):
 {
   "service": "nodaroo-cinematic-render",
   "alive": true,
+  "public_url": "https://word-word-word-word.trycloudflare.com",
   "specs": {"cpu_count": 2, "ram_gb": 3.84, "disk_free_gb": 48.21},
   "capabilities": {"ffmpeg": true, "blender": false, "paths": ["2d"]},
   "jobs": {}
@@ -134,12 +144,51 @@ Expected (abridged):
 
 ---
 
+## 2b. Public URL — Cloudflare Tunnel (trycloudflare.com)
+
+Because the Nodaroo public address does not work (see section 2),
+`app.py` (v1.2.0+) starts an **optional Cloudflare quick tunnel** in
+the background. No account, no token, no config: on startup it
+downloads the `cloudflared` binary (~38 MB, Linux amd64, from the
+official Cloudflare GitHub release) into `.local/bin/` inside the
+server dir, then runs `cloudflared tunnel --url
+http://127.0.0.1:<PORT>`. Cloudflare gives back a public URL like
+`https://word-word-word-word.trycloudflare.com` that forwards to the
+service. Use **that** URL for every API call (sections 2 and 3).
+
+* **Where to find it:** the console log prints it prominently —
+  `[tunnel] public URL: https://....trycloudflare.com` — and `GET /`
+  reports it as `"public_url"`.
+* **It CHANGES on every restart.** Each restart gets a new random
+  `trycloudflare.com` hostname. Always read the fresh URL from the
+  log or `GET /` after a restart; do not bookmark it.
+* **It is optional.** If the binary cannot be downloaded or the
+  tunnel fails to start, the app still starts and serves locally —
+  `public_url` just stays `null` and the log shows a `[tunnel]
+  WARNING`. The tunnel never blocks or crashes startup.
+* **To turn it off:** set the env var `DISABLE_TUNNEL=1` (there is no
+  panel field for it — it is only needed if you ever want the tunnel
+  off).
+* **No new Python dependency.** The tunnel uses only the standard
+  library (`urllib`, `subprocess`, `threading`); `requirements.txt`
+  is still just Flask + Pillow.
+* **Note:** the `cloudflared` binary (~38 MB) is downloaded once
+  into `.local/bin/` and reused on later restarts. It is not part
+  of the repo — do not commit it.
+
+---
+
 ## 3. API
+
+> All examples use `<tunnel-url>` — the `https://<...>.trycloudflare.com`
+> URL from the console log or `GET /` (section 2b). It changes on every
+> restart. The Nodaroo address `au1.nodaroo.fun:25571` does not
+> resolve/answer from the internet, so do not use it.
 
 ### Submit a 2D job
 
 ```bash
-curl -X POST http://au1.nodaroo.fun:25571/render \
+curl -X POST <tunnel-url>/render \
   -H "Content-Type: application/json" \
   -d @example-2d-job.json
 # {"job_id": "a1b2c3d4", "status": "queued", "type": "2d"}
@@ -176,18 +225,18 @@ Scene fields:
 ### Check a job
 
 ```bash
-curl http://au1.nodaroo.fun:25571/jobs/a1b2c3d4
+curl <tunnel-url>/jobs/a1b2c3d4
 # {"id": "a1b2c3d4", "type": "2d", "status": "done", "progress": 1.0,
 #  "output": "the-red-screen-test.mp4", "log": [...]}
 
-curl http://au1.nodaroo.fun:25571/jobs
+curl <tunnel-url>/jobs
 # list all jobs with status + progress
 ```
 
 ### Download the finished mp4
 
 ```bash
-curl -O http://au1.nodaroo.fun:25571/download/a1b2c3d4
+curl -O <tunnel-url>/download/a1b2c3d4
 ```
 
 ### Submit a Blender job (3D, optional)
@@ -196,7 +245,7 @@ Requires a `blender` binary on the server. Upload the `.blend` file as
 multipart form data:
 
 ```bash
-curl -X POST http://au1.nodaroo.fun:25571/render \
+curl -X POST <tunnel-url>/render \
   -F "blend=@myscene.blend" \
   -F "frame_start=1" -F "frame_end=48" \
   -F "fps=24" -F "resolution_x=1280" -F "resolution_y=720" \
@@ -224,7 +273,8 @@ service never downloads or installs Blender by itself.
 | `Blender is NOT installed on this server` on a 3D job | Expected — the 3D path needs a `blender` binary. Use the 2D path, or install Blender on the server first. |
 | Blender EEVEE fails with `Couldn't open libEGL.so.1` | EEVEE needs GPU/EGL libraries, which a bare CPU-only server may not have. Use `engine=CYCLES` instead (slower, but pure CPU) — or install the EGL libraries on the server first. |
 | Job `failed` with `total duration ... exceeds the 120s limit` | Split the video into shorter jobs (≤ 120s each) and join them with ffmpeg afterwards. The limit protects a small CPU-only server. |
-| `GET /` does not answer / connection refused | The service is not running (check the console for `[ready]`) or you are using the wrong port — use the port shown in the panel (here `25571`). |
+| `GET /` does not answer / connection refused | The service is not running (check the console for `[ready]`) or you are using the wrong address — use the **tunnel URL** from the console log / `GET /` (section 2b), not `au1.nodaroo.fun:25571` (it does not resolve/answer). |
+| `public_url` is `null` / no `[tunnel] public URL` line in the log | The tunnel did not come up — read the `[tunnel]` lines in the console. Common causes: the `cloudflared` download failed (no internet at startup — it retries on the next restart), or Cloudflare's API was unreachable from that network. The app still serves locally; only the public URL is missing. Restart the server to retry. If it keeps failing, the service can still be used from inside the container's network. |
 | Server keeps dying right after Start | Read the terminal: the last lines before `Server marked as offline...` name the missing file or the bad setting. `app.py` missing is the most common cause. |
 
 ---
@@ -233,7 +283,7 @@ service never downloads or installs Blender by itself.
 
 | File | What it is |
 |---|---|
-| `app.py` | the render service (Flask + worker + 2D/Blender renderers) |
+| `app.py` | the render service (Flask + worker + 2D/Blender renderers + optional Cloudflare quick tunnel, v1.2.0) |
 | `requirements.txt` | Flask + Pillow only — slim (Python 3.12). numpy and imageio[ffmpeg] are optional enhancements via `PY_PACKAGES` (see Slim install note) |
 | `example-2d-job.json` | 3-scene test job ("THE RED SCREEN" vibe) — submit as-is |
 | `README.md` | this file |
@@ -289,8 +339,10 @@ repos; this repo is public).
    clone (the installer clones `GIT_ADDRESS` into `/home/container/`
    and installs `requirements.txt`).
 3. Click **Start — ONCE — and wait** (1–3 minutes on first start).
-4. Check the console for `[ready] listening on 0.0.0.0:8080`,
-   then open `http://au1.nodaroo.fun:25571/` in a browser.
+4. Check the console for `[ready] listening on 0.0.0.0:8080` and for
+   the `[tunnel] public URL: https://....trycloudflare.com` line,
+   then open that tunnel URL in a browser (it is the working public
+   address — `au1.nodaroo.fun:25571` does not resolve/answer).
 
 **If the clone fails** (wrong URL, repo not found, network error),
 fall back to section 1: upload `app.py` + `requirements.txt` from
