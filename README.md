@@ -4,7 +4,8 @@ A small Flask service that renders cinematic 2D/3D videos on a Nodaroo
 (Pterodactyl) Python server. Built for AOX's **"Kang Muse"** server.
 
 * **2D cinematic renderer** (default, works with only Python + Pillow +
-  numpy + ffmpeg): JSON scene spec in, mp4 out. Tetsuoai style — dark
+  ffmpeg; numpy is an optional speed-up): JSON scene spec in, mp4 out.
+  Tetsuoai style — dark
   background, pink/magenta accent (`#ff5ab4`), big kinetic headline,
   film grain + vignette, slow push-in, hard cuts. Default 1280×720 @ 24fps.
 * **Blender 3D path** (optional): upload a `.blend` file and it renders
@@ -15,6 +16,42 @@ A small Flask service that renders cinematic 2D/3D videos on a Nodaroo
 Target runtime: **Python 3.12** (the Nodaroo container runs Python 3.12.13).
 All dependencies in `requirements.txt` are Python 3.12 compatible.
 Only free / open-source tools are used.
+
+---
+
+## Slim install — why `requirements.txt` only has Flask + Pillow
+
+On 23 Nov 2026 the Nodaroo container's `pip install -r requirements.txt`
+failed with **`OSError(28, 'No space left on device')`** while downloading
+the `imageio-ffmpeg` wheel (68.0 MB — it got to 40.4/68.0 MB, then died).
+The server's own 50 GiB quota was fine (only 92 KiB used), so the
+failure was in pip's temp/download area, which fits ~40 MB but not a
+68 MB wheel. `numpy` (15.7 MB) had the same problem in the earlier
+attempt. So `requirements.txt` is now **slim on purpose**:
+
+* **In it:** `flask` + `pillow` only — **7.5 MB total** to download,
+  far under the ~40 MB the container's temp area fits.
+* **Out of it (optional enhancements):** `numpy` and `imageio[ffmpeg]`.
+  The service runs fully without them: with no numpy it uses a
+  pure-Pillow 2D renderer (same look — gradient, glow, grain,
+  vignette — just slower: ~28s vs ~18s for the 9s example job);
+  without imageio it uses the system `ffmpeg` binary.
+* **To add them back** (only if the container has room): put them in
+  the panel's **`PY_PACKAGES`** field (space separated, Startup page):
+  `numpy imageio[ffmpeg]`. The egg installs `PY_PACKAGES` at startup
+  before running `app.py`. With numpy installed the service
+  automatically uses the faster numpy render path (it prints
+  `numpy: yes (fast 2D path)` in the startup diagnostics); with
+  imageio installed it can use the bundled ffmpeg binary when the
+  system has no ffmpeg.
+* **The service never downloads anything at runtime.** `app.py` only
+  *uses* imageio-ffmpeg when it is already installed; if neither a
+  system ffmpeg nor imageio exists, a 2D job fails with a clear
+  "No ffmpeg available" message — but the API itself still starts
+  and `GET /` still answers.
+
+The container itself is decent hardware (2 CPU cores, ~7 GB RAM) —
+only the pip download size was the problem.
 
 ---
 
@@ -41,7 +78,7 @@ Only free / open-source tools are used.
    The egg's startup script installs `requirements.txt` automatically
    (`pip install -U --prefix .local -r requirements.txt`), then runs
    `python /home/container/app.py`. First start takes 1–3 minutes
-   while pip installs Flask/Pillow/numpy/imageio.
+   while pip installs Flask/Pillow (slim — only ~7.5 MB to download).
 
 > **Do NOT click Start repeatedly.** The panel rejects duplicate power
 > actions with *"another power action is currently being processed for
@@ -57,6 +94,7 @@ Nodaroo Cinematic Render Service — starting
   RAM      : 3.84 GiB total
   Disk     : 48.21 GiB free / 50.00 GiB total
   ffmpeg   : /usr/local/bin/ffmpeg (or the imageio-ffmpeg bundled binary)
+  numpy    : no (slim install — pure-Pillow 2D path)
   blender  : NOT FOUND (3D path disabled)
   node     : NOT FOUND (not required)
   port     : 8080 (bind 0.0.0.0)
@@ -64,8 +102,11 @@ Nodaroo Cinematic Render Service — starting
 ```
 
 If `ffmpeg` shows NOT FOUND, the 2D renderer cannot encode — add
-`imageio[ffmpeg]` (already in `requirements.txt`) and restart; it
-brings a bundled ffmpeg binary.
+`imageio[ffmpeg]` via the panel's `PY_PACKAGES` field (see the Slim
+install note above) and restart; it brings a bundled ffmpeg binary.
+If `numpy` shows `no (slim install — pure-Pillow 2D path)` that is
+normal: the 2D renderer still works, just slower. Add `numpy` to
+`PY_PACKAGES` for the fast path.
 
 ---
 
@@ -178,7 +219,8 @@ service never downloads or installs Blender by itself.
 | `can't open file '/home/container/app.py'` then offline | `app.py` was never uploaded. Upload `app.py` + `requirements.txt` via **File access**, then Start. |
 | *"another power action is currently being processed for this server"* | You clicked Start/Stop/Restart twice. **Click once and wait.** The panel queues one power action at a time; a second click is rejected until the first finishes. |
 | Console shows the installer / "Running Installer" | The egg is (re)installing. Wait a few minutes, then Start. |
-| `ffmpeg: NOT FOUND` in diagnostics | System ffmpeg is missing and imageio-ffmpeg did not install. Check `requirements.txt` was uploaded before Start (the egg only installs it at startup). Restart the server. |
+| `ffmpeg: NOT FOUND` in diagnostics | System ffmpeg is missing and imageio-ffmpeg is not installed. Add `imageio[ffmpeg]` to the panel's `PY_PACKAGES` field (see the Slim install note) and restart. |
+| Job stalls mid-render / status endpoint stops answering while a job runs | On a 2-CPU box, do not hammer `GET /jobs` while a render runs. One test stalled mid-render while `/jobs` was polled every 8s; a clean run with no concurrent polling finished in 29s. Poll at most every 30s, or just wait and check when the job should be done. |
 | `Blender is NOT installed on this server` on a 3D job | Expected — the 3D path needs a `blender` binary. Use the 2D path, or install Blender on the server first. |
 | Blender EEVEE fails with `Couldn't open libEGL.so.1` | EEVEE needs GPU/EGL libraries, which a bare CPU-only server may not have. Use `engine=CYCLES` instead (slower, but pure CPU) — or install the EGL libraries on the server first. |
 | Job `failed` with `total duration ... exceeds the 120s limit` | Split the video into shorter jobs (≤ 120s each) and join them with ffmpeg afterwards. The limit protects a small CPU-only server. |
@@ -192,7 +234,7 @@ service never downloads or installs Blender by itself.
 | File | What it is |
 |---|---|
 | `app.py` | the render service (Flask + worker + 2D/Blender renderers) |
-| `requirements.txt` | Flask, Pillow, numpy, imageio[ffmpeg] (Python 3.12) |
+| `requirements.txt` | Flask + Pillow only — slim (Python 3.12). numpy and imageio[ffmpeg] are optional enhancements via `PY_PACKAGES` (see Slim install note) |
 | `example-2d-job.json` | 3-scene test job ("THE RED SCREEN" vibe) — submit as-is |
 | `README.md` | this file |
 
