@@ -21,6 +21,7 @@ What it does
 Endpoints
 ---------
   GET  /              status JSON (alive, specs, capabilities, jobs)
+  GET  /console       browser console page (one-click 2D renders)
   POST /render        submit a job (JSON for 2D, multipart for Blender)
   GET  /jobs          list jobs (status + progress)
   GET  /jobs/<id>     one job's status + log tail
@@ -42,6 +43,7 @@ Only free / open-source tools are used.
 
 import base64
 import collections
+import html
 import io
 import json
 import math
@@ -1046,6 +1048,240 @@ def run_blender_job(job):
 
 
 # ---------------------------------------------------------------------------
+# Browser console page (GET /console)
+# ---------------------------------------------------------------------------
+# AOX cannot run curl (the Pterodactyl console is not a shell) and has
+# no Postman, and Muse's automated traffic is blocked by Cloudflare
+# bot protection — so the service serves its own one-click console
+# page. Same origin as the API, so no CORS is needed. One
+# self-contained HTML page (inline CSS + JS, no external dependencies
+# or CDN), dark theme with the pink Messy accent (#ff5ab4).
+#
+# The page pre-fills the job JSON from example-2d-job.json when that
+# file is present next to app.py; otherwise it uses the built-in copy
+# below (the example file is an optional upload, so the console must
+# work without it).
+
+DEFAULT_EXAMPLE_JOB = {
+    "type": "2d",
+    "width": 1280,
+    "height": 720,
+    "fps": 24,
+    "letterbox": True,
+    "grain": 7,
+    "fade_frames": 12,
+    "output_name": "the-red-screen-test.mp4",
+    "scenes": [
+        {"headline": "THE RED SCREEN", "accent_word": "RED",
+         "subtext": "Saturday night. Every screen is red.",
+         "label": "MESSY VIRGO", "bg_color": "#0b0b16",
+         "bg_color2": "#2a0f2e", "duration": 3.0, "effect": "push-in",
+         "transition": "cut"},
+        {"headline": "CHECK FIRST", "accent_word": "CHECK",
+         "subtext": "Macro score 46. Neutral. Not panic.",
+         "label": "MESSY VIRGO", "bg_color": "#0b0b16",
+         "bg_color2": "#0f1a2e", "duration": 3.0, "effect": "push-in",
+         "transition": "fade"},
+        {"headline": "DID NOT SELL", "accent_word": "SELL",
+         "subtext": "A red screen is not a verdict.",
+         "label": "MESSY VIRGO", "bg_color": "#0b0b16",
+         "bg_color2": "#2a0f2e", "duration": 3.0, "effect": "zoom-out",
+         "transition": "cut"},
+    ],
+}
+
+
+def load_example_job():
+    """The example 2D job: example-2d-job.json if present, else the
+    built-in copy above."""
+    try:
+        with open(os.path.join(BASE_DIR, "example-2d-job.json")) as f:
+            job = json.load(f)
+        if isinstance(job, dict) and job.get("scenes"):
+            return job
+    except Exception:
+        pass
+    return json.loads(json.dumps(DEFAULT_EXAMPLE_JOB))
+
+
+CONSOLE_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Render Console — Nodaroo</title>
+<style>
+:root{--bg:#0b0b16;--panel:#151528;--text:#e8e8f0;--muted:#9a9ab0;--accent:#ff5ab4;--border:#2a2a44;--ok:#3ddc84;--err:#ff5a5a}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:860px;margin:0 auto;padding:20px 16px 48px}
+h1{font-size:22px;margin:0 0 4px}
+h1 span{color:var(--accent)}
+p.sub{color:var(--muted);margin:0 0 18px;font-size:14px}
+.meta{font-size:13px;color:var(--muted);background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:18px;word-break:break-all}
+.meta a{color:var(--accent)}
+label{display:block;font-size:13px;color:var(--muted);margin:14px 0 5px}
+input[type=text],textarea{width:100%;background:#0f0f1e;color:var(--text);border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-size:15px}
+input[type=text]:focus,textarea:focus{outline:none;border-color:var(--accent)}
+textarea{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;min-height:280px;resize:vertical}
+.row{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}
+button{background:var(--accent);color:#fff;border:none;border-radius:8px;padding:11px 20px;font-size:15px;font-weight:600;cursor:pointer}
+button.secondary{background:transparent;color:var(--text);border:1px solid var(--border)}
+button:disabled{opacity:.5;cursor:wait}
+#status{margin-top:18px;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:12px;font-size:14px;display:none}
+#status .jid{font-family:ui-monospace,Menlo,Consolas,monospace}
+#status .done a{color:var(--ok);font-weight:700}
+#log{white-space:pre-wrap;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:var(--muted);max-height:220px;overflow:auto;margin-top:10px}
+.hint{font-size:12px;color:var(--muted);margin-top:4px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>Nodaroo <span>Render Console</span></h1>
+<p class="sub">2D cinematic render — edit, hit Render, download the mp4. No curl, no Postman.</p>
+<div class="meta" id="meta">Public URL: <span id="puburl">loading…</span> · <a href="/">raw status JSON</a></div>
+<label for="headline">Headline</label>
+<input type="text" id="headline" value="__HEADLINE__">
+<div class="hint">Big bold centred headline. The accent word below is drawn in pink.</div>
+<label for="accent_word">Accent word (pink)</label>
+<input type="text" id="accent_word" value="__ACCENT_WORD__">
+<div class="hint">One word from the headline — that word renders in pink (#ff5ab4).</div>
+<label for="subtext">Subtext</label>
+<input type="text" id="subtext" value="__SUBTEXT__">
+<div class="hint">Smaller grey line under the headline.</div>
+<label for="label">Label (top-left)</label>
+<input type="text" id="label" value="__LABEL__">
+<div class="hint">Small pink caps label, e.g. MESSY VIRGO.</div>
+<label for="jobjson">Job JSON (scenes)</label>
+<textarea id="jobjson" spellcheck="false">__EXAMPLE_JSON__</textarea>
+<div class="hint">The fields above edit scene 1 of this JSON. Edit the JSON directly for multiple scenes, timings, effects and colours — it is the source of truth for the render.</div>
+<div class="row">
+<button id="renderBtn" type="button">Render</button>
+<button id="resetBtn" class="secondary" type="button">Reset example</button>
+</div>
+<div id="status"></div>
+</div>
+<script>
+(function(){
+var $=function(id){return document.getElementById(id)};
+var jobEl=$('jobjson'),statusEl=$('status'),renderBtn=$('renderBtn');
+var pollTimer=null;
+var EXAMPLE_JSON=jobEl.value;
+function esc(s){return String(s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+function showStatus(html){statusEl.style.display='block';statusEl.innerHTML=html}
+function parseJob(){try{return{ok:true,job:JSON.parse(jobEl.value)}}catch(e){return{ok:false,error:String(e)}}}
+function fillFieldsFromJob(){
+  var r=parseJob();
+  if(!r.ok||!Array.isArray(r.job.scenes)||!r.job.scenes.length)return;
+  var s=r.job.scenes[0];
+  $('headline').value=s.headline||'';
+  $('accent_word').value=s.accent_word||'';
+  $('subtext').value=s.subtext||'';
+  $('label').value=s.label||'';
+}
+function applyFieldsToJob(){
+  var r=parseJob();
+  if(!r.ok||!Array.isArray(r.job.scenes)||!r.job.scenes.length)return;
+  var s=r.job.scenes[0];
+  s.headline=$('headline').value;
+  s.accent_word=$('accent_word').value;
+  s.subtext=$('subtext').value;
+  s.label=$('label').value;
+  jobEl.value=JSON.stringify(r.job,null,2);
+}
+['headline','accent_word','subtext','label'].forEach(function(id){
+  $(id).addEventListener('input',applyFieldsToJob);
+});
+$('resetBtn').addEventListener('click',function(){
+  jobEl.value=EXAMPLE_JSON;
+  fillFieldsFromJob();
+  if(pollTimer){clearInterval(pollTimer);pollTimer=null}
+  statusEl.style.display='none';
+});
+renderBtn.addEventListener('click',function(){
+  var r=parseJob();
+  if(!r.ok){showStatus('<b>Invalid JSON:</b> '+esc(r.error));return}
+  renderBtn.disabled=true;
+  renderBtn.textContent='Submitting…';
+  fetch('/render',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(r.job)})
+    .then(function(resp){return resp.json().then(function(data){return{ok:resp.ok,data:data}})})
+    .then(function(res){
+      if(!res.ok)throw new Error(res.data.error||('HTTP error'));
+      showStatus('Job <span class="jid">'+esc(res.data.job_id)+'</span> — queued. Rendering…');
+      poll(res.data.job_id);
+    })
+    .catch(function(e){
+      showStatus('<b style="color:var(--err)">Failed to submit:</b> '+esc(String(e)));
+      renderBtn.disabled=false;
+      renderBtn.textContent='Render';
+    });
+});
+function poll(jid){
+  if(pollTimer)clearInterval(pollTimer);
+  var tick=function(){
+    fetch('/jobs/'+encodeURIComponent(jid))
+      .then(function(resp){return resp.json().then(function(data){return{ok:resp.ok,data:data}})})
+      .then(function(res){
+        if(!res.ok)throw new Error(res.data.error||('HTTP error'));
+        var d=res.data;
+        var pct=Math.round((d.progress||0)*100);
+        var html='Job <span class="jid">'+esc(d.id)+'</span> — <b>'+esc(d.status)+'</b> ('+pct+'%)';
+        if(d.error)html+='<br><b style="color:var(--err)">Error:</b> '+esc(d.error);
+        if(d.status==='done'){
+          if(pollTimer){clearInterval(pollTimer);pollTimer=null}
+          html+='<br><span class="done"><a href="/download/'+encodeURIComponent(d.id)+'">&#11015; Download '+(esc(d.output||'video'))+'</a></span>';
+          renderBtn.disabled=false;
+          renderBtn.textContent='Render';
+        }else if(d.status==='failed'){
+          if(pollTimer){clearInterval(pollTimer);pollTimer=null}
+          renderBtn.disabled=false;
+          renderBtn.textContent='Render';
+        }
+        if(d.log&&d.log.length)html+='<div id="log">'+esc(d.log.slice(-15).join('\\n'))+'</div>';
+        showStatus(html);
+      })
+      .catch(function(e){
+        if(pollTimer){clearInterval(pollTimer);pollTimer=null}
+        showStatus('<b style="color:var(--err)">Status check failed:</b> '+esc(String(e)));
+        renderBtn.disabled=false;
+        renderBtn.textContent='Render';
+      });
+  };
+  pollTimer=setInterval(tick,2000);
+  tick();
+}
+fetch('/').then(function(r){return r.json()}).then(function(d){
+  var el=$('puburl');
+  if(d.public_url){el.innerHTML='<a href="'+esc(d.public_url)+'">'+esc(d.public_url)+'</a>'}
+  else{el.textContent='(tunnel URL not up yet — this page’s address is the service)'}
+}).catch(function(){$('puburl').textContent='(could not load status)'});
+})();
+</script>
+</body>
+</html>
+"""
+
+
+def console_page_html():
+    """Render the console page with the example job pre-filled."""
+    job = load_example_job()
+    scenes = job.get("scenes") or []
+    scene = scenes[0] if scenes else {}
+    page = CONSOLE_PAGE
+    page = page.replace("__EXAMPLE_JSON__",
+                        html.escape(json.dumps(job, indent=2)))
+    page = page.replace("__HEADLINE__",
+                        html.escape(str(scene.get("headline", "")), quote=True))
+    page = page.replace("__ACCENT_WORD__",
+                        html.escape(str(scene.get("accent_word", "")), quote=True))
+    page = page.replace("__SUBTEXT__",
+                        html.escape(str(scene.get("subtext", "")), quote=True))
+    page = page.replace("__LABEL__",
+                        html.escape(str(scene.get("label", "")), quote=True))
+    return page
+
+
+# ---------------------------------------------------------------------------
 # HTTP API
 # ---------------------------------------------------------------------------
 
@@ -1071,7 +1307,8 @@ def index():
     return jsonify({
         "service": "nodaroo-cinematic-render",
         "alive": True,
-        "version": "1.2.0",
+        "version": "1.3.0",
+        "console": "/console",
         "public_url": get_public_url(),
         "specs": {
             "cpu_count": specs["cpu_count"],
@@ -1094,9 +1331,16 @@ def index():
             "max_2d_seconds": MAX_TOTAL_SECONDS,
             "max_blender_frames": MAX_BLENDER_FRAMES,
         },
-        "endpoints": ["GET /", "POST /render", "GET /jobs",
+        "endpoints": ["GET /", "GET /console", "POST /render", "GET /jobs",
                       "GET /jobs/<id>", "GET /download/<id>"],
     })
+
+
+@app.route("/console", methods=["GET"])
+def console():
+    """Browser console page — one-click 2D renders (the page itself is
+    built by console_page_html() in the console section above)."""
+    return console_page_html(), 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
 @app.route("/render", methods=["POST"])
