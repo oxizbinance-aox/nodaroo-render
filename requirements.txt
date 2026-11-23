@@ -1,0 +1,8 @@
+# Nodaroo Cinematic Render Service — dependencies
+# Target runtime: Python 3.12 (the Nodaroo container runs Python 3.12.13).
+# All versions below are Python 3.12 compatible. Keep this file minimal:
+# every extra dependency is install time + RAM on a small server.
+flask>=3.0,<4
+pillow>=10.2
+numpy>=1.26
+imageio[ffmpeg]>=2.37
