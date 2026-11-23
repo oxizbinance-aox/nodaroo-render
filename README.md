@@ -27,7 +27,9 @@ Only free / open-source tools are used.
 > the server needs `app.py` to run, and the terminal needs a running
 > server to clone it. **So the first install must go through the
 > File access tab, which works while the server is offline.**
-> GitHub (section 6) is for *updates* after the server is already running.
+> GitHub (section 6) is for installing from a repo *and* for updates —
+> but only once the clone works (see the Startup variables there).
+> If the clone fails, this File access upload is the fallback.
 
 1. In the Nodaroo panel, open the server **"Kang Muse"** → **File access** tab.
 2. Upload these two files into `/home/container/` (the server root):
@@ -200,33 +202,68 @@ panel's 50 GiB disk fills up if old outputs are never deleted).
 
 ---
 
-## 6. GitHub — SECONDARY path (updates only, after the server runs)
+## 6. GitHub — install from the repo (Startup variables must be right)
 
-The code also lives at **https://github.com/oxizbinance-aox/nodaroo-render**.
+The code also lives on GitHub:
 
-Do **not** use this for the first install — the terminal gives no
-response while the server is offline (see section 1). Use it for
-*updates* once the server is already running:
+- **Repo:** https://github.com/oxizbinance-aox/nodaroo-render
+- **Clone URL:** https://github.com/oxizbinance-aox/nodaroo-render.git
 
-```bash
-# inside /home/container, in the Pterodactyl console (server RUNNING):
-git clone https://github.com/oxizbinance-aox/nodaroo-render.git .
-```
+> **The repo must exist before the clone can work.** It was created
+> and pushed on 23 Nov 2026, so the clone works now — but if you
+> ever see a "repository not found" error, check the repo link first.
 
-Or, to pull the latest code into an existing install:
+### 6a. Startup variables — set these EXACTLY (from the real Startup page)
 
-```bash
-cd /home/container && git pull
-```
+The server's Docker image is **Python 3.12**. Its Startup page has
+9 variables: `GIT_ADDRESS`, `BRANCH`, `USER_UPLOAD`, `AUTO_UPDATE`,
+`PY_FILE`, `PY_PACKAGES`, `USERNAME`, `ACCESS_TOKEN`,
+`REQUIREMENTS_FILE`. Two are already correct and must stay as they are:
 
-For automatic updates on every restart, set these **Startup variables**
-in the panel (server Settings → Startup):
-
-| Variable | Value | Why |
+| Variable | Value | Notes |
 |---|---|---|
-| `PY_FILE` | `app.py` | the file the egg runs (default is already `app.py`) |
-| `REQUIREMENTS_FILE` | `requirements.txt` | auto-installed by the egg at startup |
-| `AUTO_UPDATE` | `1` | the egg runs `git pull` on restart when a `.git` dir exists |
+| `PY_FILE` | `app.py` | already set — do not change |
+| `REQUIREMENTS_FILE` | `requirements.txt` | already set — do not change |
 
-With `AUTO_UPDATE=1`, restarting the server after a `git push` pulls
-the newest code automatically.
+Set these three for the GitHub path:
+
+| Variable | Set to | Why |
+|---|---|---|
+| `GIT_ADDRESS` | `https://github.com/oxizbinance-aox/nodaroo-render` | **bare URL ONLY — do NOT type `git clone` in front of it.** The field takes just the URL; writing `git clone https://…` in this field breaks the clone. |
+| `USER_UPLOAD` | **OFF** | When it is ON the installer **skips the git clone** entirely (it assumes you uploaded the files yourself). It must be OFF for the GitHub path. |
+| `AUTO_UPDATE` | **ON** | When ON, the startup script runs `git pull` on every restart, so the server always runs the latest pushed code. |
+
+The other variables do not need changing: `BRANCH` (the repo's
+default branch is `main`), `PY_PACKAGES` (empty — `requirements.txt`
+covers it), `USERNAME` / `ACCESS_TOKEN` (only needed for *private*
+repos; this repo is public).
+
+### 6b. Install steps (GitHub path)
+
+1. Open the server → **Settings → Startup** and set the three
+   variables above (`GIT_ADDRESS` bare URL, `USER_UPLOAD` OFF,
+   `AUTO_UPDATE` ON).
+2. Click **Reinstall Server** — this is the step that performs the
+   clone (the installer clones `GIT_ADDRESS` into `/home/container/`
+   and installs `requirements.txt`).
+3. Click **Start — ONCE — and wait** (1–3 minutes on first start).
+4. Check the console for `[ready] listening on 0.0.0.0:8080`,
+   then open `http://au1.nodaroo.fun:25571/` in a browser.
+
+**If the clone fails** (wrong URL, repo not found, network error),
+fall back to section 1: upload `app.py` + `requirements.txt` from
+the Drive zip via File access — that path works while the server
+is offline.
+
+### 6c. Updates AFTER the server is running (GitHub path)
+
+Once the server is running, the Pterodactyl console accepts input
+again, so updates are easy:
+
+```bash
+# inside /home/container, while the server is RUNNING:
+git pull
+```
+
+Or simply **restart the server** — with `AUTO_UPDATE=ON` the egg's
+startup script runs `git pull` for you before starting `app.py`.
