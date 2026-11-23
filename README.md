@@ -178,6 +178,34 @@ service. Use **that** URL for every API call (sections 2 and 3).
 
 ---
 
+## 2c. Browser console — one-click renders (`/console`)
+
+Open **`<tunnel-url>/console`** in any browser that can reach the
+tunnel URL. No curl, no Postman, no install — the page is served by
+the service itself (same origin, so no CORS).
+
+* **What it is:** a single dark page (pink `#ff5ab4` accent) with
+  text fields for **headline**, **accent word** (the one word drawn
+  in pink), **subtext** and **label**, plus the full job JSON in a
+  text area, **pre-filled with the `example-2d-job.json` content**.
+  The fields edit scene 1 of the JSON as you type; edit the JSON
+  directly for multiple scenes, timings, effects and colours.
+* **How it works:** click **Render** — the page POSTs the job to
+  `/render`, shows the job ID, then polls `/jobs/<id>` every 2
+  seconds and shows status + log tail. When the job is DONE it
+  shows a **download link** for the mp4 (`/download/<id>`).
+  **Reset example** restores the pre-filled job.
+* The top of the page shows the current public URL (from `GET /`)
+  and a link to the raw status JSON.
+* **Why it exists:** the Pterodactyl console is not a shell (typed
+  `curl` commands do nothing) and Muse's automated traffic is
+  blocked by Cloudflare bot protection — so the browser page is the
+  practical way to submit a render.
+* **Note:** the console only covers 2D jobs. Blender 3D jobs still
+  need a multipart upload (section 3).
+
+---
+
 ## 3. API
 
 > All examples use `<tunnel-url>` — the `https://<...>.trycloudflare.com`
@@ -283,7 +311,7 @@ service never downloads or installs Blender by itself.
 
 | File | What it is |
 |---|---|
-| `app.py` | the render service (Flask + worker + 2D/Blender renderers + optional Cloudflare quick tunnel, v1.2.0) |
+| `app.py` | the render service (Flask + worker + 2D/Blender renderers + optional Cloudflare quick tunnel + browser console page, v1.3.0) |
 | `requirements.txt` | Flask + Pillow only — slim (Python 3.12). numpy and imageio[ffmpeg] are optional enhancements via `PY_PACKAGES` (see Slim install note) |
 | `example-2d-job.json` | 3-scene test job ("THE RED SCREEN" vibe) — submit as-is |
 | `README.md` | this file |
