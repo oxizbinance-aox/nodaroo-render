@@ -47,11 +47,13 @@ import json
 import math
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
+import urllib.request
 import uuid
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont
@@ -163,7 +165,215 @@ def print_diagnostics():
     print(f"  node     : {s['node'] or 'NOT FOUND (not required)'}", flush=True)
     print(f"  port     : {PORT} (bind 0.0.0.0)", flush=True)
     print(f"  jobs dir : {JOBS_DIR}", flush=True)
+    print(f"  tunnel   : {'disabled (DISABLE_TUNNEL set)' if _tunnel_disabled() else 'starting in background — URL appears below + in GET / (public_url)'}", flush=True)
     print("=" * 62, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Cloudflare Tunnel — optional public URL (trycloudflare.com quick tunnel)
+# ---------------------------------------------------------------------------
+# The Nodaroo public address (au1.nodaroo.fun:25571) does not resolve or
+# answer from the internet (23 Nov 2026: AOX's laptop got NXDOMAIN, the
+# cloud browser got name_not_resolved, and the one resolver that did
+# answer gave a 198.18.x.x address that never answers HTTP). The server
+# has exactly 1 network allocation and no alternative public IP, so the
+# app exposes itself through an OUTBOUND Cloudflare quick tunnel
+# instead. No account, no token, no config: cloudflared dials out to
+# Cloudflare and prints a public https://<random>.trycloudflare.com URL
+# that forwards to localhost:PORT.
+#
+# The URL CHANGES on every restart — read it from the console log
+# ("[tunnel] public URL: ...") or from GET / ("public_url").
+#
+# This is OPTIONAL: if the binary cannot be downloaded or the tunnel
+# fails, the app still starts and serves locally (public_url stays
+# null). It never blocks or crashes startup. Disable it entirely with
+# the env var DISABLE_TUNNEL=1.
+#
+# Only the Python standard library is used (urllib, subprocess,
+# threading) — no new dependency in requirements.txt.
+
+CLOUDFLARED_URL = ("https://github.com/cloudflare/cloudflared/releases/"
+                   "latest/download/cloudflared-linux-amd64")
+CLOUDFLARED_DIR = os.path.join(BASE_DIR, ".local", "bin")
+CLOUDFLARED_BIN = os.path.join(CLOUDFLARED_DIR, "cloudflared")
+_TUNNEL_URL_RE = re.compile(
+    r"https://(?!api\.)[a-z0-9-]+\.trycloudflare\.com")
+# NOTE: the (?!api\.) lookahead matters — cloudflared logs the API
+# endpoint https://api.trycloudflare.com while requesting the tunnel,
+# and that is NOT the tunnel's public URL. The real quick-tunnel URL
+# is a random word combo, e.g. https://word-word-word.trycloudflare.com.
+PUBLIC_URL = None
+_PUBLIC_URL_LOCK = threading.Lock()
+
+
+def _tunnel_disabled():
+    return os.environ.get("DISABLE_TUNNEL", "").strip().lower() in (
+        "1", "true", "yes")
+
+
+def get_public_url():
+    with _PUBLIC_URL_LOCK:
+        return PUBLIC_URL
+
+
+def _set_public_url(url):
+    global PUBLIC_URL
+    with _PUBLIC_URL_LOCK:
+        PUBLIC_URL = url
+
+
+def ensure_cloudflared(timeout=180):
+    """Download the cloudflared binary (Linux amd64) if it is missing.
+
+    Downloads straight into the server dir (.local/bin), NOT /tmp —
+    the Nodaroo container's pip temp area only fits ~40 MB, while the
+    server dir has a 50 GB quota. Returns the binary path, or None
+    when the download (or the sanity check) fails.
+    """
+    if os.path.isfile(CLOUDFLARED_BIN) and os.access(CLOUDFLARED_BIN, os.X_OK):
+        return CLOUDFLARED_BIN
+    try:
+        os.makedirs(CLOUDFLARED_DIR, exist_ok=True)
+    except Exception as exc:
+        print(f"[tunnel] WARNING: cannot create {CLOUDFLARED_DIR} ({exc}) — "
+              "continuing WITHOUT a public URL", flush=True)
+        return None
+    tmp_path = CLOUDFLARED_BIN + ".download"
+    try:
+        print(f"[tunnel] downloading cloudflared (~38 MB) ...", flush=True)
+        req = urllib.request.Request(
+            CLOUDFLARED_URL,
+            headers={"User-Agent": "nodaroo-render/1.2.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp, \
+                open(tmp_path, "wb") as out:
+            total = int(resp.headers.get("Content-Length") or 0)
+            got = 0
+            while True:
+                chunk = resp.read(1024 * 256)
+                if not chunk:
+                    break
+                out.write(chunk)
+                got += len(chunk)
+        print(f"[tunnel] downloaded {got / 1024 / 1024:.1f} MB"
+              + (f" (expected {total / 1024 / 1024:.1f} MB)" if total else ""),
+              flush=True)
+        os.chmod(tmp_path, 0o755)
+        os.replace(tmp_path, CLOUDFLARED_BIN)
+        proc = subprocess.run([CLOUDFLARED_BIN, "--version"],
+                              capture_output=True, text=True, timeout=30)
+        ver = (proc.stdout or proc.stderr or "").strip().splitlines()
+        print(f"[tunnel] cloudflared ready: {ver[0] if ver else 'ok'}",
+              flush=True)
+        return CLOUDFLARED_BIN
+    except Exception as exc:
+        print(f"[tunnel] WARNING: cloudflared download failed ({exc}) — "
+              "continuing WITHOUT a public URL", flush=True)
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        return None
+
+
+def _tunnel_reader(proc):
+    """Drain cloudflared's output forever; pick up the public URL.
+
+    Runs in a daemon thread. When the process exits, the public URL
+    is cleared (the supervisor restarts the tunnel).
+    """
+    try:
+        for line in proc.stdout:
+            m = _TUNNEL_URL_RE.search(line)
+            if m and get_public_url() != m.group(0):
+                _set_public_url(m.group(0))
+                print(f"[tunnel] public URL: {m.group(0)}", flush=True)
+    except Exception:
+        pass
+    try:
+        proc.wait()
+    except Exception:
+        pass
+    print(f"[tunnel] cloudflared exited (code {proc.returncode}); "
+          "public URL is dead", flush=True)
+    _set_public_url(None)
+
+
+def _start_tunnel_proc():
+    """Start one cloudflared quick tunnel process. Returns it, or None."""
+    exe = ensure_cloudflared()
+    if not exe:
+        return None
+    cmd = [exe, "tunnel", "--url", f"http://127.0.0.1:{PORT}"]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1)
+    except Exception as exc:
+        print(f"[tunnel] WARNING: could not start cloudflared ({exc}) — "
+              "continuing WITHOUT a public URL", flush=True)
+        return None
+    threading.Thread(target=_tunnel_reader, args=(proc,), daemon=True).start()
+    return proc
+
+
+def tunnel_loop():
+    """Background supervisor: keep a cloudflared quick tunnel up.
+
+    Runs forever as a daemon thread. If the tunnel dies (or never
+    prints a URL), it restarts after a backoff. It never raises — a
+    failed tunnel must never affect the Flask app.
+    """
+    if _tunnel_disabled():
+        print("[tunnel] disabled via DISABLE_TUNNEL — no public URL",
+              flush=True)
+        return
+    backoff = 5
+    while True:
+        try:
+            proc = _start_tunnel_proc()
+            if proc is None:
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 300)
+                continue
+            # wait until the URL appears or the process dies (<= 120s)
+            deadline = time.time() + 120
+            while time.time() < deadline:
+                if get_public_url():
+                    backoff = 5
+                    break
+                if proc.poll() is not None:
+                    break
+                time.sleep(1)
+            if get_public_url():
+                # tunnel is up; wait for it to die, then restart it
+                while get_public_url() and proc.poll() is None:
+                    time.sleep(5)
+                print("[tunnel] tunnel went down; restarting...",
+                      flush=True)
+                continue
+            print("[tunnel] cloudflared produced no URL; retrying...",
+                  flush=True)
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 300)
+        except Exception as exc:  # supervisor must never die
+            print(f"[tunnel] WARNING: supervisor error ({exc}); retrying...",
+                  flush=True)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 300)
+
+
+def start_tunnel_background():
+    """Launch the tunnel supervisor in a daemon thread. Never raises."""
+    try:
+        t = threading.Thread(target=tunnel_loop, daemon=True)
+        t.start()
+    except Exception as exc:
+        print(f"[tunnel] WARNING: could not start tunnel thread ({exc}) — "
+              "continuing WITHOUT a public URL", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -861,7 +1071,8 @@ def index():
     return jsonify({
         "service": "nodaroo-cinematic-render",
         "alive": True,
-        "version": "1.1.0",
+        "version": "1.2.0",
+        "public_url": get_public_url(),
         "specs": {
             "cpu_count": specs["cpu_count"],
             "ram_gb": specs["ram_gb"],
@@ -996,6 +1207,11 @@ if __name__ == "__main__":
     print_diagnostics()
     worker = threading.Thread(target=worker_loop, daemon=True)
     worker.start()
+    # Cloudflare quick tunnel (optional, non-blocking): gives the service
+    # a public https://<random>.trycloudflare.com URL because the
+    # Nodaroo public address does not resolve/answer. If it fails,
+    # the app still serves locally — public_url just stays null.
+    start_tunnel_background()
     print(f"[ready] listening on 0.0.0.0:{PORT} — "
           f"GET / for status, POST /render to queue a job", flush=True)
     # threaded dev server is fine for a single-user render box
